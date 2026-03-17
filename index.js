@@ -111,9 +111,7 @@ app.post("/messages", async (req, res) => {
 //   console.log(`🚀 Server running on port ${port}`);
 // });
 
-app.listen(port, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+
 
 
 
