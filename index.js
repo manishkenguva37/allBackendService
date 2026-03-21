@@ -5,40 +5,25 @@ import Pusher from "pusher";
 import pkg from "pg";
 
 const { Pool } = pkg;
-
+import myMiddleware from "./MIDDLEWARE/organsationMiddleware"
 dotenv.config();
 
 const app = express();
 const port = 3000;
 
-// ✅ CORS FIX (important for Codespaces)
-// app.use(cors({
-//   origin: true,
-//   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-//   allowedHeaders: ["Content-Type", "Authorization"]
-// }));
-// app.options("*", cors());
-// app.use(cors({
-//   origin: "*",
-//   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-//   allowedHeaders: ["Content-Type", "Authorization"],
-// }));
+// ================= MIDDLEWARE =================
+
+// Global JSON (for normal routes)
+app.use(express.json());
 
 app.use(cors({
   origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-org-name", "x-org-secret"],
 }));
-app.use(cors());
-app.use(express.json());
-// VERY IMPORTANT for preflight requests
-// app.options("*", (req, res) => {
-//   res.setHeader("Access-Control-Allow-Origin", "*");
-//   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-//   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-//   res.sendStatus(200);
-// });
 
+// ================= DATABASE =================
 
-// ✅ DATABASE CONNECTION
 const { PGHOST, PGDATABASE, PGUSER, PGPASSWORD } = process.env;
 
 const pool = new Pool({
@@ -47,12 +32,11 @@ const pool = new Pool({
   user: PGUSER,
   password: PGPASSWORD,
   port: 5432,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 });
 
-// ✅ PUSHER CONFIG
+// ================= PUSHER =================
+
 const pusher = new Pusher({
   appId: "2115469",
   key: "7666f32ac3b90070c7fa",
@@ -61,227 +45,204 @@ const pusher = new Pusher({
   useTLS: true,
 });
 
+// ================= CRYPTO =================
+
+async function decryptHeader(base64Ciphertext) {
+  try {
+    if (!base64Ciphertext || typeof base64Ciphertext !== "string") {
+      throw new Error("Invalid ciphertext: must be a non-empty string");
+    }
+
+    const enc = new TextEncoder();
+
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      enc.encode(process.env.NODEHANDLER),
+      { name: "PBKDF2" },
+      false,
+      ["deriveKey"]
+    );
+
+    const key = await crypto.subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: enc.encode("org-credentials-salt"),
+        iterations: 100000,
+        hash: "SHA-256",
+      },
+      keyMaterial,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["decrypt"]
+    );
+
+    const combined = Uint8Array.from(atob(base64Ciphertext), c => c.charCodeAt(0));
+
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv },
+      key,
+      ciphertext
+    );
+
+    return new TextDecoder().decode(decrypted);
+
+  } catch (err) {
+    console.error("❌ Decryption failed:", err.message);
+    throw err;
+  }
+}
+
 // ================= ROUTES =================
 
+// Health
 app.get("/", (req, res) => {
-  res.json({ status: "Server is working ✅" });
+  res.json({ status: "OK" });
 });
 
-// 🟢 GET all messages
+
+app.use(myMiddleware);
+
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const encOrgName = req.headers["x-org-name"];
+    const encOrgSecret = req.headers["x-org-secret"];
+
+    if (!encOrgName || !encOrgSecret) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing org headers",
+      });
+    }
+
+    // 🔐 Decrypt headers
+    let orgName, orgSecret;
+
+    try {
+      orgName = await decryptHeader(encOrgName);
+      orgSecret = await decryptHeader(encOrgSecret);
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: "Header decryption failed",
+      });
+    }
+
+    // ✅ Validate org
+    const orgCheck = await pool.query(
+      `SELECT * FROM organizationsvalidation 
+       WHERE organizationname = $1 AND organizationsecret = $2`,
+      [orgName, orgSecret]
+    );
+
+    if (orgCheck.rows.length === 0) {
+      return res.status(403).json({
+        success: false,
+        message: "Invalid organisation credentials",
+      });
+    }
+
+    // 🔐 Decrypt BODY (NOW FIXED)
+    let userData;
+
+    try {
+     const encryptedBody = req.body?.data; // ✅ now STRING
+
+      const decrypted = await decryptHeader(encryptedBody);
+      userData = JSON.parse(decrypted);
+
+    } catch (err) {
+      console.error("Body decrypt error:", err.message);
+
+      return res.status(400).json({
+        success: false,
+        message: "Invalid encrypted body",
+      });
+    }
+
+    const { email, password, name } = userData;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Email & password required",
+      });
+    }
+
+    // 👉 (Optional) Insert user
+    // TODO: hash password before saving
+
+    await pool.query(
+      `INSERT INTO users (name, email, password_hash)
+       VALUES ($1, $2, $3)`,
+      [name || "", email, password] // ⚠️ hash later
+    );
+
+    res.json({
+      success: true,
+      message: "Signup successful",
+    });
+
+  } catch (err) {
+  console.error("Signup error:", err);
+
+  // 🔥 USER ALREADY EXISTS
+  if (err.code === "42703") {
+    return res.status(400).json({
+      success: false,
+      message: "User already exists",
+    });
+  }
+
+  // 🔴 OTHER ERRORS
+  res.status(500).json({
+    success: false,
+    message: "Internal server error",
+  });
+}
+});
+
+// ================= OTHER ROUTES =================
+
 app.get("/messages", async (req, res) => {
   try {
     const result = await pool.query(
       "SELECT * FROM messages ORDER BY created_at DESC"
     );
     res.json(result.rows);
-  } catch (err) {
+  } catch {
     res.status(500).json({ error: "DB error" });
   }
 });
 
-// 🔵 CREATE message + send realtime
 app.post("/messages", async (req, res) => {
   const { title, description } = req.body;
 
   try {
     const result = await pool.query(
       `INSERT INTO messages (title, description)
-       VALUES ($1, $2)
-       RETURNING *`,
+       VALUES ($1, $2) RETURNING *`,
       [title, description]
     );
 
     const newMessage = result.rows[0];
 
-    // 🔔 SEND REALTIME EVENT
     await pusher.trigger("notifications", "new-message", {
       user: newMessage.title,
       message: newMessage.description,
     });
 
     res.json(newMessage);
-  } catch (err) {
+
+  } catch {
     res.status(500).json({ error: "Insert error" });
   }
 });
 
-// ================= START SERVER =================
+// ================= START =================
 
-// app.listen(port, () => {
-//   console.log(`🚀 Server running on port ${port}`);
-// });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// import express from "express";
-// import dotenv from "dotenv";
-// import cors from "cors";
-// import Pusher from "pusher";
-// import pkg from "pg";
-
-// const { Pool } = pkg;
-
-// dotenv.config();
-
-// const app = express();
-// const port = 3000;
-
-// // middleware
-// // app.use(cors({
-// //   origin: "*",   // allow all origins (for dev)
-// // }));
-// app.use(cors({
-//   origin: true,   // allow all origins dynamically
-//   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-//   allowedHeaders: ["Content-Type", "Authorization"],
-//   credentials: true
-// }));
-
-// // VERY IMPORTANT for preflight
-// app.options("*", cors());
-// app.use(express.json());
-
-// // database connection
-// const { PGHOST, PGDATABASE, PGUSER, PGPASSWORD } = process.env;
-
-// const pool = new Pool({
-//   host: PGHOST,
-//   database: PGDATABASE,
-//   user: PGUSER,
-//   password: PGPASSWORD,
-//   port: 5432,
-//   ssl: {
-//     rejectUnauthorized: true,
-//   },
-// });
-
-// // Pusher config
-// const pusher = new Pusher({
-//   appId: "2115469",
-//   key: "7666f32ac3b90070c7fa",
-//   secret: "e9d0d0296f19e92df9a0",
-//   cluster: "ap2",
-//   useTLS: true,
-// });
-
-
-// // 🟢 GET all messages
-// app.get("/messages", async (req, res) => {
-//   try {
-//     const result = await pool.query(
-//       "SELECT * FROM messages ORDER BY created_at DESC"
-//     );
-//     res.json(result.rows);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "DB error" });
-//   }
-// });
-
-
-// // 🔵 CREATE message + trigger pusher
-// app.post("/messages", async (req, res) => {
-//   const { title, description } = req.body;
-
-//   try {
-//     const result = await pool.query(
-//       `INSERT INTO messages (title, description)
-//        VALUES ($1, $2)
-//        RETURNING *`,
-//       [title, description]
-//     );
-
-//     const newMessage = result.rows[0];
-
-//     // 🔔 send realtime event
-//     await pusher.trigger("my-channel", "my-event", newMessage);
-
-//     res.json(newMessage);
-//   } catch (err) {
-//     console.error(err);
-//     res.status(500).json({ error: "Insert error" });
-//   }
-// });
-
-
-// // 🟡 UPDATE message
-// app.put("/messages/:id", async (req, res) => {
-//   const { id } = req.params;
-//   const { title, description } = req.body;
-
-//   try {
-//     const result = await pool.query(
-//       `UPDATE messages
-//        SET title=$1, description=$2, updated_at=CURRENT_TIMESTAMP
-//        WHERE id=$3
-//        RETURNING *`,
-//       [title, description, id]
-//     );
-
-//     res.json(result.rows[0]);
-//   } catch (err) {
-//     res.status(500).json({ error: "Update failed" });
-//   }
-// });
-
-
-// // 🔴 DELETE message
-// app.delete("/messages/:id", async (req, res) => {
-//   const { id } = req.params;
-
-//   try {
-//     await pool.query("DELETE FROM messages WHERE id=$1", [id]);
-//     res.json({ success: true });
-//   } catch (err) {
-//     res.status(500).json({ error: "Delete failed" });
-//   }
-// });
-
-
-// app.listen(port, () => {
-//   console.log(`🚀 Server running on http://localhost:${port}`);
-// });
-
-
-
-// // app.get('/', async (req, res) => {
-// //   // Acquire a dedicated client connection from the pool
-// //   // client.query() with manual release: Best for multiple queries or transactions
-// //   // ✅ Reuses same connection (more efficient)
-// //   // ✅ Avoids creating separate connections for each query
-// //   const client = await pool.connect()
-// //   try {
-// //     // First query: INSERT into posts table
-// //     await client.query("INSERT INTO posts (id, title, description) VALUES (1, 'First Post', 'Description First post')")
-    
-// //     // Second query: SELECT all posts
-// //     // Both queries run on the same client connection - no overhead of reconnecting
-// //     const result = await client.query('SELECT * FROM posts')
-// //     res.json(result.rows)
-// //   } catch (error) {
-// //     console.log(error)
-// //     res.status(500).json({ error: 'Database error' })
-// //   } finally {
-// //     // Manually release the client back to the pool when done
-// //     // This ensures the connection can be reused by other requests
-// //     client.release()
-// //   }
-// // })
+app.listen(port, () => {
+  console.log(`🚀 Server running on port ${port}`);
+});
